@@ -321,8 +321,12 @@ def outliers(df, columns=None, method="iqr", factor=1.5, threshold=3.0):
     return table, rows
 
 
-def plot_outliers(df, columns=None, factor=1.5, save_as=None):
-    """Boxplots on standardized values so all columns share one scale."""
+def plot_outliers(df, columns=None, factor=1.5, row=None, save_as=None):
+    """Boxplots on standardized values so all columns share one scale.
+
+    row: index label of one row to highlight (e.g. from the rows returned by outliers()).
+         Its values are drawn as stars: red where it is an outlier, black elsewhere.
+    """
     cols = _columns(df, columns)
     x = df[cols]
     z = (x - x.mean()) / x.std().replace(0, 1)
@@ -331,6 +335,20 @@ def plot_outliers(df, columns=None, factor=1.5, save_as=None):
     ax.set_xticks(range(1, len(cols) + 1), cols, rotation=90)
     ax.set_ylabel("Standardized value (z)")
     ax.set_title("Outliers per column")
+    if row is not None:
+        if row not in df.index:
+            raise KeyError(f"Row {row!r} not found in the index")
+        q1, q3 = z.quantile(0.25), z.quantile(0.75)
+        values = z.loc[row]
+        is_out = values.lt(q1 - factor * (q3 - q1)) | values.gt(q3 + factor * (q3 - q1))
+        positions = np.arange(1, len(cols) + 1)
+        ax.scatter(positions[~is_out], values[~is_out], marker="*", s=150, color="black",
+                   zorder=3, label=f"row {row}")
+        ax.scatter(positions[is_out], values[is_out], marker="*", s=150, color="tab:red",
+                   edgecolor="black", zorder=3, label=f"row {row} (outlier)")
+        ax.legend()
+        ax.set_title(f"Row {row} against the other values")
+        print(f"Row {row} is an outlier in: {list(values.index[is_out]) or 'no selected column'}")
     _finish(fig, save_as)
 
 
