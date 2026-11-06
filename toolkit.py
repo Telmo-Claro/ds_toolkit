@@ -15,7 +15,9 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 
 OUTPUT_DIR = Path("output")
-TRANSFORMS = ("minmax", "standard", "robust", "log")
+TRANSFORMS = ("minmax", "standard", "robust", "log", "log10")
+TEXT_TYPES = ["object", "string", "category", "bool"]
+COPY_SUFFIX = "_copy"  # changed data is saved next to the original as <name>_copy.csv
 
 plt.style.use("ggplot")
 
@@ -48,6 +50,54 @@ def _columns(df, columns, minimum=1):
     if len(cols) < minimum:
         raise ValueError(f"Select at least {minimum} column(s), got {len(cols)}")
     return cols
+
+
+def _column(df, column):
+    """Validate one column name of any type."""
+    if column not in df.columns:
+        raise KeyError(f"Unknown column '{column}'. Available: {list(df.columns)}")
+    return column
+
+
+def _category(df, column=None, exclude=()):
+    """A grouping column: the given one, else the text column with the fewest distinct values."""
+    if column is not None:
+        return _column(df, column)
+    candidates = [c for c in df.select_dtypes(include=TEXT_TYPES).columns
+                  if c not in exclude and df[c].nunique() > 1]
+    if not candidates:
+        other = f" other than {list(exclude)}" if exclude else ""
+        raise ValueError(f"No text column{other} to group by; pass a column name explicitly")
+    return min(candidates, key=lambda c: df[c].nunique())
+
+
+def _labels(df, *columns):
+    """Copy of df with True/False grouping columns turned into text, so their values work as labels."""
+    bools = [c for c in columns if pd.api.types.is_bool_dtype(df[c])]
+    return df.astype({c: str for c in bools}) if bools else df
+
+
+def _value(df, value=None):
+    """A numeric value column: the given one, else the first feature."""
+    return _columns(df, value if value is not None else _features(df)[:1])[0]
+
+
+def _tidy_index(table):
+    """Show whole-number float labels (e.g. years read as 2006.0) as integers."""
+    idx = table.index
+    if pd.api.types.is_float_dtype(idx) and np.all(np.mod(idx, 1) == 0):
+        table.index = idx.astype(int)
+    return table
+
+
+def _bounds(x, method, factor, threshold):
+    """Per-column (lower, upper) outlier bounds for the IQR or z-score method."""
+    if method == "iqr":
+        q1, q3 = x.quantile(0.25), x.quantile(0.75)
+        return q1 - factor * (q3 - q1), q3 + factor * (q3 - q1)
+    if method == "zscore":
+        return x.mean() - threshold * x.std(), x.mean() + threshold * x.std()
+    raise ValueError('method must be "iqr" or "zscore"')
 
 
 def _color_column(df, color_by):
@@ -103,7 +153,8 @@ def list_datasets(data_dir="data"):
     if not files:
         print(f"No CSV files in {data_dir.resolve()}")
     for f in files:
-        print(f"{f.name:45s} {f.stat().st_size / 1e6:8.2f} MB")
+        note = "  (changed copy)" if f.stem.endswith(COPY_SUFFIX) else ""
+        print(f"{f.name:45s} {f.stat().st_size / 1e6:8.2f} MB{note}")
 
 
 def _detect_separator(path):
@@ -113,6 +164,28 @@ def _detect_separator(path):
         return csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
     except csv.Error:
         return ","
+
+
+def copy_path(source):
+    """Where the changed copy of `source` is saved: same folder, name + COPY_SUFFIX."""
+    p = Path(source)
+    stem = p.stem if p.stem.endswith(COPY_SUFFIX) else p.stem + COPY_SUFFIX
+    return p.with_name(stem + p.suffix)
+
+
+def _changed(out, df, changed):
+    """Mark `out` as different from the loaded file when this step (or an earlier one) changed it,
+    and then save it as the copy. The original file is never written to."""
+    out.attrs["modified"] = bool(df.attrs.get("modified") or changed)
+    source = out.attrs.get("source")
+    if out.attrs["modified"] and source:
+        path = copy_path(source)
+        out.to_csv(path, index=False)
+        if path == Path(source):
+            print(f"Updated the copy {path} (the original data file is untouched)")
+        else:
+            print(f"Saved the changed data as {path} (the original {Path(source).name} is untouched)")
+    return out
 
 
 def load_csv(data_dir="data", file=None, sep=None, header="auto", index_col=None):
@@ -155,6 +228,7 @@ def load_csv(data_dir="data", file=None, sep=None, header="auto", index_col=None
     leftover = [c for c in df.columns if c.startswith("Unnamed: 0")]
     if leftover and (df[leftover[0]].to_numpy() == np.arange(len(df))).all():
         df = df.drop(columns=leftover[0])
+    df.attrs.update(source=str(path), modified=False)
     print(f"Loaded {path} -> {df.shape[0]} rows x {df.shape[1]} columns (header row: {'yes' if has_header else 'no'})")
     return df
 
@@ -180,6 +254,121 @@ def summary(df, columns=None):
     """count, mean, std, min, Q1, median, Q3, max per column (all numeric columns when None)."""
     cols = list(df.select_dtypes("number").columns) if columns is None else _columns(df, columns)
     return df[cols].describe().T
+
+
+def data_issues(df):
+    """List common data problems: missing values, duplicates, ID-like, constant and mistyped columns."""
+    issues = []
+    n_dup = int(df.duplicated().sum())
+    if n_dup:
+        issues.append(("(all columns)", "duplicate rows", f"{n_dup} fully identical rows"))
+    for c in df.columns:
+        s = df[c]
+        n_missing = int(s.isna().sum())
+        if n_missing:
+            issues.append((c, "missing values", f"{n_missing} ({n_missing / len(df):.1%})"))
+        n_unique = s.nunique()
+        if n_unique <= 1:
+            issues.append((c, "constant", "only one distinct value: carries no information"))
+        elif n_unique == len(df) and not pd.api.types.is_float_dtype(s):
+            issues.append((c, "ID-like", "a different value in every row: probably an identifier"))
+        if pd.api.types.is_float_dtype(s) and n_missing < len(df) and np.all(np.mod(s.dropna(), 1) == 0):
+            issues.append((c, "whole numbers stored as decimals",
+                           "often caused by missing values; may be a count, code or year"))
+        if s.dtype.kind in "OUT" or pd.api.types.is_string_dtype(s):
+            as_number = pd.to_numeric(s.dropna(), errors="coerce")
+            if len(as_number) and as_number.notna().mean() > 0.9:
+                issues.append((c, "numbers stored as text",
+                               f"{int(as_number.isna().sum())} value(s) are not numbers"))
+    if not issues:
+        print("No common data issues found")
+    return pd.DataFrame(issues, columns=["column", "issue", "detail"])
+
+
+def clean(df, duplicates=True, required=None, keep=None, integer=None):
+    """Remove problem rows. Each step reports how many rows it dropped.
+
+    duplicates: True = drop fully identical rows; a list of columns = drop rows that repeat
+                those columns (e.g. ["Name", "Platform"]); False = keep everything.
+    required:   columns that must be filled in; rows missing any of them are dropped.
+    keep:       {column: (min, max)} keeps only rows inside the range (inclusive). None = no limit.
+                Missing values are left alone here; list the column in `required` to drop them.
+    integer:    columns to store as whole numbers (e.g. ["Year"], read as 2006.0 because of
+                missing values). Columns that still have missing values become a nullable
+                integer type; real decimals (e.g. 2006.5) raise an error instead of being rounded.
+    """
+    data = df.copy()
+    start = len(data)
+    if duplicates:
+        subset = None if duplicates is True else [_column(data, c) for c in duplicates]
+        before = len(data)
+        data = data.drop_duplicates(subset=subset)
+        print(f"Duplicates ({'all columns' if subset is None else subset}): {before - len(data)} rows dropped")
+    for c in [required] if isinstance(required, str) else (required or []):
+        before = len(data)
+        data = data.dropna(subset=[_column(data, c)])
+        print(f"Missing {c}: {before - len(data)} rows dropped")
+    for c, (low, high) in (keep or {}).items():
+        s = data[_columns(data, [c])[0]]
+        inside = s.isna() | ((low is None) | (s >= low)) & ((high is None) | (s <= high))
+        print(f"Outside {c} range ({low}, {high}): {int((~inside).sum())} rows dropped")
+        data = data[inside]
+    converted = []
+    for c in [integer] if isinstance(integer, str) else (integer or []):
+        s = data[_columns(data, [c])[0]]
+        if pd.api.types.is_integer_dtype(s):
+            continue
+        fractional = s.dropna()[np.mod(s.dropna(), 1) != 0]
+        if len(fractional):
+            raise ValueError(f"{c} has {len(fractional)} value(s) with decimals, e.g. {fractional.iloc[0]}; "
+                             "they cannot be stored as whole numbers")
+        data[c] = s.astype("int64" if s.notna().all() else "Int64")
+        converted.append(c)
+    if converted:
+        print(f"Stored as whole numbers: {converted}")
+    print(f"Clean dataset: {len(data)} of {start} rows kept")
+    data.attrs = dict(df.attrs)
+    return _changed(data, df, len(data) < start or bool(converted))
+
+
+def combine(df, keys, sum=None, lowest=None):
+    """Merge rows that are the same item (e.g. versions of one game) into one row.
+
+    keys:   columns that together identify the item, e.g. ["Name", "Platform", "Publisher"].
+            Rows with a missing key value are left alone, so unrelated rows are never merged.
+    sum:    numeric columns to add up (e.g. sales); None = every numeric column not listed
+            in keys or lowest.
+    lowest: columns that keep their smallest value (e.g. "Year" = first release, "Rank").
+    Every other column keeps the value of the group's first row.
+    """
+    keys = [_column(df, k) for k in ([keys] if isinstance(keys, str) else keys)]
+    lowest = [_column(df, c) for c in ([lowest] if isinstance(lowest, str) else (lowest or []))]
+    if sum is None:
+        sum = [c for c in df.select_dtypes("number").columns if c not in keys + lowest]
+    sum = _columns(df, sum)
+
+    complete = df[keys].notna().all(axis=1)
+    sizes = df[complete].groupby(keys, sort=False)[keys[0]].transform("size")
+    repeated = df[complete][sizes > 1]
+    if repeated.empty:
+        print(f"No rows share the same {keys}: nothing to combine")
+        return _changed(df.copy(), df, False)
+
+    how = {c: "first" for c in df.columns if c not in keys}
+    how.update({c: "sum" for c in sum})
+    how.update({c: "min" for c in lowest})
+    groups = repeated.groupby(keys, sort=False)
+    merged = groups.agg(how).reset_index()[df.columns]
+    merged.index = groups.head(1).index  # each group takes the place of its first row
+    out = pd.concat([df.drop(index=repeated.index), merged]).sort_index()
+
+    print(f"Combined {len(repeated)} rows into {len(merged)} (same {keys}); "
+          f"rows: {len(df)} -> {len(out)}")
+    print(f"Added up: {sum}" + (f" | kept the lowest: {lowest}" if lowest else ""))
+    shown = merged[keys + lowest + sum].head(10)
+    print(shown.to_string(index=False))
+    out.attrs = dict(df.attrs)
+    return _changed(out, df, True)
 
 
 def prepare(df, target="auto", features=None, drop=(), missing="drop"):
@@ -217,14 +406,15 @@ def prepare(df, target="auto", features=None, drop=(), missing="drop"):
     elif missing is not None:
         raise ValueError('missing must be "drop", "mean", "median" or None')
 
-    data.attrs.update(target=target, features=features)
+    data.attrs = {**df.attrs, "target": target, "features": features}
     print(f"Target: {target}")
     if target is not None:
         print(f"Class counts: {data[target].value_counts().to_dict()}")
     print(f"Features ({len(features)}): {features}")
     print(f"Missing feature values: {n_missing} (handling: {missing})")
     print(f"Working dataset: {data.shape[0]} rows")
-    return data
+    filled = missing in ("mean", "median") and n_missing > 0
+    return _changed(data, df, data.shape != df.shape or filled)
 
 
 # ---------------------------------------------------------------- Part 3: transformation
@@ -239,11 +429,11 @@ def transform(df, method, columns=None):
         out = (x - x.mean()) / x.std(ddof=0).replace(0, 1)
     elif method == "robust":  # center on median, scale by IQR
         out = (x - x.median()) / (x.quantile(0.75) - x.quantile(0.25)).replace(0, 1)
-    elif method == "log":     # log(1 + x); columns with negatives are shifted to start at 0
+    elif method in ("log", "log10"):  # log(1 + x); columns with negatives are shifted to start at 0
         shift = (-x.min()).clip(lower=0)
         if (shift > 0).any():
             print(f"Shifted before log: {list(shift[shift > 0].index)}")
-        out = np.log1p(x + shift)
+        out = np.log1p(x + shift) if method == "log" else np.log10(1 + x + shift)
     else:
         raise ValueError(f"method must be one of {TRANSFORMS}")
     out.attrs = {**df.attrs, "features": cols}
@@ -251,6 +441,25 @@ def transform(df, method, columns=None):
     if target is not None:  # keep the target so later steps can still color by it
         out[target] = df[target]
     return out
+
+
+def add_transformed(df, method, columns=None, suffix=None):
+    """Return a copy of df with transformed columns added next to the originals.
+
+    New columns are named "<column>_<suffix>" (suffix defaults to the method, e.g. Global_Sales_log)
+    and become features, so the later steps include them.
+    """
+    cols = _columns(df, columns)
+    transformed = transform(df, method, cols)
+    out = df.copy()
+    new = []
+    for c in cols:
+        name = f"{c}_{suffix or method}"
+        out[name] = transformed[c]
+        new.append(name)
+    out.attrs = {**df.attrs, "features": [f for f in _features(df) if f not in new] + new}
+    print(f"Added: {new}")
+    return _changed(out, df, True)
 
 
 # ---------------------------------------------------------------- Part 4: descriptive analysis
@@ -265,6 +474,36 @@ def describe(df, columns=None):
         "min": x.min(), "max": x.max(), "range": x.max() - x.min(),
         "Q1": q1, "Q2": q2, "Q3": q3, "IQR": q3 - q1,
     })
+
+
+def top(df, by=None, n=10, columns=None, compare=None):
+    """The n rows with the highest value in `by`, and how much they stand out.
+
+    columns: extra columns to show; None = the first 3 text columns (e.g. name, platform, genre).
+    compare: a transformation ("log", "log10", ...) to show next to the raw values, to see
+             whether the top rows still dominate after transforming.
+    Columns added: pct_of_total (share of the column total) and x_median (times the median row).
+    """
+    by = _value(df, by)
+    if columns is None:
+        columns = [c for c in df.select_dtypes(include=TEXT_TYPES).columns][:3]
+    columns = [_column(df, c) for c in ([columns] if isinstance(columns, str) else columns) if c != by]
+
+    def stand_out(values, label):
+        total, median = values.sum(), values.median()
+        ranked = values.loc[rows.index]
+        rows[label] = ranked
+        rows[f"pct_of_total{label[len(by):]}"] = (ranked / total * 100).round(2)
+        rows[f"x_median{label[len(by):]}"] = (ranked / median).round(1) if median else np.nan
+        times = f", #1 is {ranked.iloc[0] / median:.1f}x the median" if median else ""
+        print(f"Top {n} {label}: {ranked.sum() / total:.1%} of the total{times}")
+
+    rows = df.nlargest(n, by)[columns].copy()
+    stand_out(df[by], by)
+    if compare:
+        stand_out(transform(df, compare, [by])[by], f"{by}_{compare}")
+    rows.index = pd.RangeIndex(1, len(rows) + 1, name="rank")
+    return rows
 
 
 # ---------------------------------------------------------------- Part 5: relationships
@@ -304,21 +543,46 @@ def outliers(df, columns=None, method="iqr", factor=1.5, threshold=3.0):
     method="zscore": |z| > threshold
     """
     x = df[_columns(df, columns)]
+    lower, upper = _bounds(x, method, factor, threshold)
+    mask = x.lt(lower) | x.gt(upper)
     if method == "iqr":
         q1, q3 = x.quantile(0.25), x.quantile(0.75)
-        lower, upper = q1 - factor * (q3 - q1), q3 + factor * (q3 - q1)
-    elif method == "zscore":
-        lower, upper = x.mean() - threshold * x.std(), x.mean() + threshold * x.std()
+        spread = {"Q1": q1, "Q3": q3, "IQR": q3 - q1}
     else:
-        raise ValueError('method must be "iqr" or "zscore"')
-    mask = x.lt(lower) | x.gt(upper)
+        spread = {"mean": x.mean(), "std": x.std()}
     table = pd.DataFrame({
-        "lower_bound": lower, "upper_bound": upper,
+        **spread, "lower_bound": lower, "upper_bound": upper,
         "n_outliers": mask.sum(), "pct_outliers": (mask.mean() * 100).round(2),
     }).sort_values("n_outliers", ascending=False)
     rows = df[mask.any(axis=1)]
     print(f"Method: {method} | rows with at least one outlier: {len(rows)} of {len(df)}")
     return table, rows
+
+
+def handle_outliers(df, columns=None, action="keep", method="iqr", factor=1.5, threshold=3.0):
+    """Return a copy of df with outliers handled.
+
+    action: "keep" (no change), "remove" (drop rows with an outlier in any selected column),
+            "median" (replace outlier values by the column median) or
+            "clip" (cap outlier values at the lower / upper bound).
+    """
+    cols = _columns(df, columns)
+    x = df[cols]
+    lower, upper = _bounds(x, method, factor, threshold)
+    mask = x.lt(lower) | x.gt(upper)
+    out = df.copy()
+    if action == "remove":
+        out = out[~mask.any(axis=1)]
+    elif action == "median":
+        out[cols] = x.mask(mask, x.median(), axis=1)
+    elif action == "clip":
+        out[cols] = x.clip(lower, upper, axis=1)
+    elif action != "keep":
+        raise ValueError('action must be "keep", "remove", "median" or "clip"')
+    out.attrs = dict(df.attrs)
+    print(f"Outlier values ({method}): {int(mask.sum().sum())} in {int(mask.any(axis=1).sum())} rows "
+          f"| action: {action} | rows now: {len(out)} of {len(df)}")
+    return _changed(out, df, action != "keep" and bool(mask.any().any()))
 
 
 def plot_outliers(df, columns=None, factor=1.5, row=None, save_as=None):
@@ -410,7 +674,7 @@ def heatmap(matrix, title="", cmap="coolwarm", vmin=None, vmax=None, fmt=".2f", 
     """Lower-triangle heatmap (no mirrored half, no diagonal) with a value in every cell."""
     # Drop the first row and last column: they would only hold the diagonal / mirrored half.
     tri = matrix.iloc[1:, :-1]
-    values = tri.to_numpy(dtype=float)
+    values = np.array(tri, dtype=float)  # a writable copy
     values[np.triu_indices_from(values, k=1)] = np.nan
     n = len(tri)
     if vmin is None or vmax is None:
@@ -509,3 +773,252 @@ def plot_pca(components, color_by="target", save_as=None):
     ax2d.set_ylabel(labels[1])
     ax2d.set_title("PCA — 2D")
     _finish(fig, save_as)
+
+
+# ---------------------------------------------------------------- group analysis
+
+AGGREGATIONS = ("sum", "mean", "median", "count")
+
+
+def _bar_colors(n):
+    return plt.get_cmap("tab10" if n <= 10 else "tab20")(np.arange(n) % 20)
+
+
+def _rotate_labels(ax):
+    ax.tick_params(axis="x", rotation=45)
+    for label in ax.get_xticklabels():
+        label.set_ha("right")
+
+
+def aggregate(df, by=None, value=None, agg="sum", top=None, plot="auto", save_as=None):
+    """Summarize `value` per group of `by`: count, sum, mean, median and share of the total.
+
+    by:   grouping column, e.g. "Genre" or "Year"; None = the text column with the fewest values.
+    agg:  what to rank and plot: "sum", "mean", "median" or "count".
+    top:  keep only the n largest groups (by `agg`); None = all.
+    plot: "bar", "line", None, or "auto" (line for a numeric `by` such as a year, else bar).
+    A numeric `by` (e.g. a year) stays in its natural order; other groups are sorted by `agg`.
+    """
+    by = _category(df, by)
+    value = _value(df, value)
+    df = _labels(df, by)
+    if agg not in AGGREGATIONS:
+        raise ValueError(f"agg must be one of {AGGREGATIONS}")
+    n_missing = int(df[by].isna().sum())
+    if n_missing:
+        print(f"{n_missing} rows without {by} are left out")
+    g = df.groupby(by, observed=True)[value]
+    table = pd.DataFrame({"count": g.count(), "sum": g.sum(), "mean": g.mean(), "median": g.median()})
+    table["share_pct"] = (table["sum"] / table["sum"].sum() * 100).round(2)
+    ordered = pd.api.types.is_numeric_dtype(df[by])
+    if top:
+        table = table.loc[table.index.isin(table[agg].nlargest(top).index)]
+    if not ordered:
+        table = table.sort_values(agg, ascending=False)
+    table = _tidy_index(table)
+
+    best = table[agg].nlargest(min(3, len(table)))
+    print(f"{agg} of {value} per {by} ({len(table)} groups). Highest: "
+          + ", ".join(f"{k} ({v:,.2f})" for k, v in best.items()))
+
+    if plot == "auto":
+        plot = "line" if ordered else "bar"
+    if plot:
+        fig, ax = plt.subplots(figsize=(max(6, min(0.45 * len(table) + 2, 16)), 4.5))
+        if plot == "line":
+            peak = table[agg].idxmax()
+            ax.plot(table.index, table[agg], marker="o", markersize=3, color="tab:blue")
+            ax.annotate(f"peak: {peak}", (peak, table[agg].max()), textcoords="offset points", xytext=(5, 5))
+        elif plot == "bar":
+            ax.bar(table.index.astype(str), table[agg], color="tab:blue")
+            _rotate_labels(ax)
+        else:
+            raise ValueError('plot must be "bar", "line", "auto" or None')
+        ax.set_xlabel(by)
+        ax.set_ylabel(f"{agg} of {value}")
+        ax.set_title(f"{agg.capitalize()} of {value} per {by}")
+        _finish(fig, save_as)
+    return table
+
+
+def pivot(df, rows=None, columns=None, value=None, agg="sum", top_rows=None, top_columns=None,
+          share=None, plot="stacked", save_as=None):
+    """Cross table of `value` for every combination of two grouping columns, plus a chart.
+
+    rows / columns: the two grouping columns (e.g. "Platform" and "Genre"); None = the two
+                    text columns with the fewest values.
+    top_rows / top_columns: keep only the n largest groups of each; None = all.
+    share:  None = the plain values; "rows" = each row as % of its total
+            ("which genres make up this platform"); "columns" = each column as %.
+    plot:   "stacked" bars, "grouped" bars, "heatmap", "line" (handy when rows are years) or None.
+    """
+    rows = _category(df, rows)
+    columns = _category(df, columns, exclude=[rows])
+    value = _value(df, value)
+    if rows == columns:
+        raise ValueError("rows and columns must be different columns")
+    if agg not in AGGREGATIONS:
+        raise ValueError(f"agg must be one of {AGGREGATIONS}")
+    df = _labels(df, rows, columns)
+    data = df.dropna(subset=[rows, columns])
+    if top_rows:
+        keep = data.groupby(rows, observed=True)[value].agg(agg).nlargest(top_rows).index
+        data = data[data[rows].isin(keep)]
+    if top_columns:
+        keep = data.groupby(columns, observed=True)[value].agg(agg).nlargest(top_columns).index
+        data = data[data[columns].isin(keep)]
+
+    table = data.pivot_table(index=rows, columns=columns, values=value, aggfunc=agg, observed=True)
+    if agg in ("sum", "count"):
+        table = table.fillna(0)
+    if not pd.api.types.is_numeric_dtype(df[rows]):
+        table = table.loc[table.sum(axis=1).sort_values(ascending=False).index]
+    table = table[table.sum(axis=0).sort_values(ascending=False).index]
+    if share == "rows":
+        table = table.div(table.sum(axis=1), axis=0) * 100
+    elif share == "columns":
+        table = table.div(table.sum(axis=0), axis=1) * 100
+    elif share is not None:
+        raise ValueError('share must be None, "rows" or "columns"')
+    table = _tidy_index(table.round(2))
+    label = f"{agg} of {value}" + (f" (% of each {rows if share == 'rows' else columns})" if share else "")
+    title = f"{label} per {rows} and {columns}"
+
+    if plot in ("stacked", "grouped", "line"):
+        per_row = 0.5 if plot != "grouped" else 0.2 * len(table.columns)
+        fig, ax = plt.subplots(figsize=(max(7, min(per_row * len(table) + 3, 18)), 5))
+        colors = _bar_colors(len(table.columns))
+        if plot == "line":
+            table.plot(ax=ax, color=colors, marker="o", markersize=2)
+        else:
+            table.plot(ax=ax, kind="bar", stacked=plot == "stacked", color=colors, width=0.8)
+            _rotate_labels(ax)
+        ax.set_ylabel(label)
+        ax.legend(title=columns, bbox_to_anchor=(1.01, 1), loc="upper left")
+        ax.set_title(title)
+        _finish(fig, save_as)
+    elif plot == "heatmap":
+        values = table.to_numpy(dtype=float)
+        fig, ax = plt.subplots(figsize=(max(6, 0.7 * len(table.columns) + 3), max(4, 0.4 * len(table) + 2)))
+        im = ax.imshow(values, cmap="Blues", aspect="auto")
+        ax.set_xticks(range(len(table.columns)), table.columns, rotation=45, ha="right")
+        ax.set_yticks(range(len(table)), table.index)
+        vmax = np.nanmax(values) if np.isfinite(values).any() else 1
+        for i, j in np.ndindex(values.shape):
+            if not np.isnan(values[i, j]):
+                ax.text(j, i, f"{values[i, j]:.3g}", ha="center", va="center", fontsize=8,
+                        color="white" if values[i, j] > 0.6 * vmax else "black")
+        fig.colorbar(im, ax=ax, label=label)
+        ax.set_xlabel(columns)
+        ax.set_ylabel(rows)
+        ax.grid(False)
+        ax.set_title(title)
+        _finish(fig, save_as)
+    elif plot is not None:
+        raise ValueError('plot must be "stacked", "grouped", "heatmap", "line" or None')
+    return table
+
+
+def simpson(df, group=None, by=None, value=None, agg="mean", min_count=10, min_gap_pct=5, pair=None,
+            plot=True, save_as=None):
+    """Look for Simpson's paradox: group A beats group B overall, but B beats A inside most subgroups.
+
+    group: the column whose groups are compared (e.g. "Genre").
+    by:    the column that splits the data into subgroups (e.g. "Platform").
+    agg:   "mean" or "median" of `value` per group.
+    min_count: a subgroup only counts when both groups have at least this many rows in it.
+    min_gap_pct: A must beat B overall by at least this many percent, so near-ties are skipped.
+    pair:  two groups to show in detail, e.g. ("Action", "Puzzle"); None = the strongest reversal.
+    Returns one row per reversed pair, strongest first.
+    """
+    group = _category(df, group)
+    by = _category(df, by, exclude=[group])
+    value = _value(df, value)
+    if agg not in ("mean", "median"):
+        raise ValueError('agg must be "mean" or "median"')
+    df = _labels(df, group, by)
+    data = df.dropna(subset=[group, by, value])
+    overall = data.groupby(group, observed=True)[value].agg(agg)
+    within = data.pivot_table(index=by, columns=group, values=value, aggfunc=agg, observed=True)
+    counts = data.pivot_table(index=by, columns=group, values=value, aggfunc="count", observed=True)
+    within = within.where(counts >= min_count)
+
+    found = []
+    for a in overall.index:
+        for b in overall.index:
+            if overall[a] <= overall[b] * (1 + min_gap_pct / 100):
+                continue  # each pair once, with a = the clear overall winner
+            both = within[[a, b]].dropna()
+            if len(both) < 2:
+                continue
+            loser_wins = int((both[b] > both[a]).sum())
+            if loser_wins > len(both) / 2:
+                found.append({"overall_winner": a, "overall_loser": b,
+                              f"winner_{agg}": overall[a], f"loser_{agg}": overall[b],
+                              "overall_gap_pct": round(100 * (overall[a] / overall[b] - 1), 1),
+                              f"{by}_compared": len(both), "loser_wins_in": loser_wins,
+                              "reversal_pct": round(100 * loser_wins / len(both), 1)})
+    table = pd.DataFrame(found)
+    print(f"Compared the {agg} {value} of every pair of {group} groups inside each {by} "
+          f"(only {by} values with at least {min_count} rows of both, overall gap at least {min_gap_pct}%).")
+    if table.empty:
+        print("No Simpson's paradox found. Try another `by`, `agg`, or a lower `min_count` / `min_gap_pct`.")
+        return table
+    table = table.sort_values(["reversal_pct", f"{by}_compared"], ascending=False, ignore_index=True)
+    print(f"Reversed pairs found: {len(table)}")
+
+    if pair:
+        a, b = (str(p) if isinstance(p, (bool, np.bool_)) else p for p in pair)
+    else:
+        a, b = table.loc[0, "overall_winner"], table.loc[0, "overall_loser"]
+    for g in (a, b):
+        if g not in overall.index:
+            raise KeyError(f"'{g}' is not a group of {group}")
+    detail = pd.DataFrame({a: within[a], b: within[b], f"n_{a}": counts[a], f"n_{b}": counts[b]})
+    detail = detail.dropna(subset=[a, b])
+    detail.index = detail.index.astype(str)
+    detail.loc["Overall"] = [overall[a], overall[b], (data[group] == a).sum(), (data[group] == b).sum()]
+    detail[[f"n_{a}", f"n_{b}"]] = detail[[f"n_{a}", f"n_{b}"]].astype(int)
+    detail["higher"] = np.where(detail[a] > detail[b], a, b)
+    n_sub = len(detail) - 1
+    print(f"\n{a} vs {b}: overall, {a} has the higher {agg} ({overall[a]:.3f} vs {overall[b]:.3f}), "
+          f"but {b} is higher in {int((detail['higher'].iloc[:-1] == b).sum())} of {n_sub} {by} subgroups.")
+    print(f"Look at the counts (n_): the overall {agg} depends on how each group is spread over {by}.")
+    if plot:
+        fig, ax = plt.subplots(figsize=(max(7, 0.8 * len(detail) + 2), 4.5))
+        x = np.arange(len(detail))
+        ax.bar(x - 0.2, detail[a], 0.4, label=a, color="tab:blue")
+        ax.bar(x + 0.2, detail[b], 0.4, label=b, color="tab:orange")
+        ax.axvline(n_sub - 0.5, color="grey", linestyle="--")
+        ax.set_xticks(x, detail.index, rotation=45, ha="right")
+        ax.set_ylabel(f"{agg} of {value}")
+        ax.set_xlabel(by)
+        ax.legend(title=group)
+        ax.set_title(f"Simpson's paradox check: {a} vs {b} per {by}, and overall")
+        _finish(fig, save_as)
+    print(detail.round(3).to_string())
+    return table
+
+
+def concentration(df, group=None, by=None, value=None, top=5):
+    """How much of each group's total is held by its `top` largest `by` values.
+
+    E.g. group="Genre", by="Publisher": the share of each genre's sales that its 5 biggest
+    publishers own. Low = an open market, high = dominated by a few players.
+    """
+    group = _category(df, group)
+    by = _category(df, by, exclude=[group])
+    value = _value(df, value)
+    data = _labels(df, group, by).dropna(subset=[group, by])
+    share_col = f"top{top}_share_pct"
+    rows = []
+    for g, part in data.groupby(group, observed=True):
+        totals = part.groupby(by, observed=True)[value].sum().sort_values(ascending=False)
+        total = totals.sum()
+        rows.append({group: g, "count": len(part), f"n_{by}": len(totals),
+                     share_col: round(100 * totals.head(top).sum() / total, 1) if total else np.nan,
+                     "leaders": ", ".join(map(str, totals.index[:3]))})
+    table = pd.DataFrame(rows).set_index(group).sort_values(share_col)
+    print(f"Share of each {group}'s {value} held by its {top} largest {by} values "
+          "(low = open market, high = dominated by a few).")
+    return table
